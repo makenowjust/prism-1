@@ -2,25 +2,25 @@
 
 module Prism
   class PatternVM
-    class Compiler < BasicVisitor
-      # Raised when the query given to a pattern is either invalid Ruby syntax or
-      # is using syntax that we don't yet support.
-      class CompilationError < StandardError
-        def initialize(repr)
-          super(<<~ERROR)
-            prism was unable to compile the pattern you provided into a usable
-            expression. It failed on to understand the node represented by:
-  
-            #{repr}
-  
-            Note that not all syntax supported by Ruby's pattern matching syntax
-            is also supported by prism's patterns. If you're using some syntax
-            that you believe should be supported, please open an issue on
-            GitHub at https://github.com/ruby/prism/issues/new.
-          ERROR
-        end
+    # Raised when the query given to a pattern is either invalid Ruby syntax or
+    # is using syntax that we don't yet support.
+    class CompilationError < StandardError
+      def initialize(repr)
+        super(<<~ERROR)
+          prism was unable to compile the pattern you provided into a usable
+          expression. It failed on to understand the node represented by:
+
+          #{repr}
+
+          Note that not all syntax supported by Ruby's pattern matching syntax
+          is also supported by prism's patterns. If you're using some syntax
+          that you believe should be supported, please open an issue on
+          GitHub at https://github.com/ruby/prism/issues/new.
+        ERROR
       end
-  
+    end
+
+    class Compiler < BasicVisitor
       class Label
         attr_reader :jumps, :splits
 
@@ -256,7 +256,8 @@ module Prism
         @passing = nil
         @failing = nil
 
-        vm.reify!
+        optimize_jumps
+        link_labels
       end
 
       # in nil
@@ -316,6 +317,132 @@ module Prism
           compile_error(node)
         end
       end
+
+      def follow_jump(label)
+        index = vm.insns.index(label)
+
+        if vm.insns[index + 1] == :jump
+          follow_jump(vm.insns[index + 2])
+        else
+          label
+        end
+      end
+
+      # Accepts a PC that refers to a label and finds the label that it should
+      # actually be jumping to in case of a jump->jump sequence.
+      def optimize_jump(pc)
+        old_label = vm.insns[pc]
+        new_label = follow_jump(old_label)
+
+        if old_label != new_label
+          old_label.jumps.delete(pc)
+          new_label.jumps.push(pc)
+          vm.insns[pc] = new_label
+        end
+      end
+
+      # Accepts a PC that refers to a split label hash and finds the labels that
+      # they should actually be jumping to in case of a jump->jump sequence.
+      def optimize_split(pc)
+        split = vm.insns[pc]
+        split.each do |type, old_label|
+          new_label = follow_jump(old_label)
+
+          if old_label != new_label
+            key = [pc, type]
+
+            old_label.splits.delete(key)
+            new_label.splits.push(key)
+
+            split[type] = new_label
+          end
+        end
+      end
+
+      # Make a pass over the instructions to eliminate jump->jump sequences.
+      def optimize_jumps
+        pc = 0
+        max_pc = vm.insns.length
+
+        while pc < max_pc
+          case vm.insns[pc]
+          when :fail, :pop
+            pc += 1
+          when :jump
+            optimize_jump(pc + 1)
+            pc += 2
+          when :pushfield, :pushindex
+            pc += 2
+          when :checklength, :checkobject, :checktype
+            optimize_jump(pc + 1)
+            pc += 3
+          when :splittype
+            optimize_split(pc + 1)
+            optimize_jump(pc + 2)
+            pc += 3
+          else
+            pc += 1
+          end
+        end
+      end
+
+      def link_labels
+        # First, we need to find all of the PCs in the list of instructions and
+        # track where they are to find their current PCs.
+        insns = vm.insns
+        labels = vm.labels
+
+        pc = 0
+        max_pc = insns.length
+
+        pcs = {}
+        while pc < max_pc
+          case (insn = insns[pc])
+          when :fail, :pop
+            pc += 1
+          when :jump, :pushfield, :pushindex
+            pc += 2
+          when :checklength, :checkobject, :checktype, :splittype
+            pc += 3
+          else
+            if insn.is_a?(Compiler::Label)
+              (pcs[pc] ||= []) << insn
+              pc += 1
+            else
+              raise "Unknown instruction: #{insn.inspect}"
+            end
+          end
+        end
+
+        # Next, we need to find their new PCs by accounting for them being
+        # removed from the list of instructions.
+        pcs.transform_keys!.with_index do |key, index|
+          key - index
+        end
+
+        # Next, set up the new list of labels to point to the correct PCs.
+        pcs = pcs.each_with_object({}) do |(pc, labels), result|
+          labels.each do |label|
+            result[label] = pc
+          end
+        end
+
+        # Next, we need to go back and patch the instructions where we should be
+        # jumping to labels to point to the correct PC.
+        labels.each do |label|
+          label.jumps.each do |pc|
+            insns[pc] = pcs[label]
+          end
+
+          label.splits.each do |(pc, type)|
+            insns[pc][type] = pcs[label]
+          end
+        end
+
+        # Finally, we can remove all of the labels from the list of
+        # instructions.
+        insns.reject! { |insn| insn.is_a?(Compiler::Label) }
+      end
     end
 
     attr_reader :insns, :labels, :pattern
@@ -326,6 +453,10 @@ module Prism
       @pattern = pattern
     end
 
+    ############################################################################
+    # These methods are the public API of the pattern class.                   #
+    ############################################################################
+
     def or(other)
       PatternVM.new("#{pattern} | #{other.pattern}")
     end
@@ -333,106 +464,6 @@ module Prism
 
     def compile
       Prism.parse("nil in #{pattern}").value.statements.body.first.accept(Compiler.new(self))
-    end
-
-    def compile_jump(label)
-      index = insns.index(label)
-
-      case insns[index + 1]
-      when :jump
-        compile_jump(insns[index + 2])
-      else
-        label
-      end
-    end
-
-    def reify!
-      # First pass is to eliminate jump->jump transitions.
-      pc = 0
-      max_pc = insns.length
-
-      while pc < max_pc
-        case (insn = insns[pc])
-        when :fail, :pop
-          pc += 1
-        when :jump
-          # insns[pc + 1] is the direct jump label
-          insns[pc + 1]
-          pc += 2
-        when :pushfield, :pushindex
-          pc += 2
-        when :checklength, :checkobject, :checktype
-          # insns[pc + 1] is the failing label
-          pc += 3
-        when :splittype
-          # insns[pc + 1] is a hash of labels, insns[pc + 2] is the failing label
-          dispatch = insns[pc + 1]
-          dispatch.each do |type, old_label|
-            new_label = compile_jump(old_label)
-            if old_label != new_label
-              old_label.splits.delete([pc + 1, type])
-              new_label.splits.push([pc + 1, type])
-              dispatch[type] = new_label
-            end
-          end
-
-          pc += 3
-        else
-          pc += 1
-        end
-      end
-
-      # First, we need to find all of the PCs in the list of instructions and
-      # track where they are to find their current PCs.
-      pc = 0
-      max_pc = insns.length
-
-      pcs = {}
-      while pc < max_pc
-        case (insn = insns[pc])
-        when :fail, :pop
-          pc += 1
-        when :jump, :pushfield, :pushindex
-          pc += 2
-        when :checklength, :checkobject, :checktype, :splittype
-          pc += 3
-        else
-          if insn.is_a?(Compiler::Label)
-            (pcs[pc] ||= []) << insn
-            pc += 1
-          else
-            raise "Unknown instruction: #{insn.inspect}"
-          end
-        end
-      end
-
-      # Next, we need to find their new PCs by accounting for them being removed
-      # from the list of instructions.
-      pcs.transform_keys!.with_index do |key, index|
-        key - index
-      end
-
-      # Next, set up the new list of labels to point to the correct PCs.
-      pcs = pcs.each_with_object({}) do |(pc, labels), result|
-        labels.each do |label|
-          result[label] = pc
-        end
-      end
-
-      # Next, we need to go back and patch the instructions where we should be
-      # jumping to labels to point to the correct PC.
-      labels.each do |label|
-        label.jumps.each do |pc|
-          insns[pc] = pcs[label]
-        end
-
-        label.splits.each do |(pc, type)|
-          insns[pc][type] = pcs[label]
-        end
-      end
-
-      # Finally, we can remove all of the labels from the list of instructions.
-      insns.reject! { |insn| insn.is_a?(Compiler::Label) }
     end
 
     def disasm
@@ -524,6 +555,10 @@ module Prism
 
       true
     end
+
+    ############################################################################
+    # These methods are used to generate bytecode.                             #
+    ############################################################################
 
     def checklength(length, label)
       insns.push(:checklength, length, label)
