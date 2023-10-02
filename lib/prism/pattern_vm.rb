@@ -247,7 +247,53 @@ module Prism
       Prism.parse("nil in #{pattern}").value.statements.body.first.accept(Compiler.new(self))
     end
 
+    def compile_jump(label)
+      index = insns.index(label)
+
+      case insns[index + 1]
+      when :jump
+        compile_jump(insns[index + 2])
+      else
+        label
+      end
+    end
+
     def reify!
+      # First pass is to eliminate jump->jump transitions.
+      pc = 0
+      max_pc = insns.length
+
+      while pc < max_pc
+        case (insn = insns[pc])
+        when :fail, :pop
+          pc += 1
+        when :jump
+          # insns[pc + 1] is the direct jump label
+          insns[pc + 1]
+          pc += 2
+        when :pushfield, :pushindex
+          pc += 2
+        when :checklength, :checktype
+          # insns[pc + 1] is the failing label
+          pc += 3
+        when :splittype
+          # insns[pc + 1] is a hash of labels, insns[pc + 2] is the failing label
+          dispatch = insns[pc + 1]
+          dispatch.each do |type, old_label|
+            new_label = compile_jump(old_label)
+            if old_label != new_label
+              old_label.splits.delete([pc + 1, type])
+              new_label.splits.push([pc + 1, type])
+              dispatch[type] = new_label
+            end
+          end
+
+          pc += 3
+        else
+          pc += 1
+        end
+      end
+
       # First, we need to find all of the PCs in the list of instructions and
       # track where they are to find their current PCs.
       pc = 0
@@ -383,12 +429,12 @@ module Prism
     end
 
     def checklength(length, label)
-      insns.push(:checklength, length, -1)
+      insns.push(:checklength, length, label)
       label.push_jump(insns.length - 1)
     end
 
     def checktype(type, label)
-      insns.push(:checktype, type, -1)
+      insns.push(:checktype, type, label)
       label.push_jump(insns.length - 1)
     end
 
@@ -397,7 +443,7 @@ module Prism
     end
 
     def jump(label)
-      insns.push(:jump, -1)
+      insns.push(:jump, label)
       label.push_jump(insns.length - 1)
     end
 
