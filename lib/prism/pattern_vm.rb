@@ -230,11 +230,20 @@ module Prism
       end
     end
 
-    attr_reader :insns, :labels
+    attr_reader :insns, :labels, :pattern
 
     def initialize(pattern)
       @insns = []
       @labels = []
+      @pattern = pattern
+    end
+
+    def or(other)
+      PatternVM.new("#{pattern} | #{other.pattern}")
+    end
+    alias | or
+
+    def compile
       Prism.parse("nil in #{pattern}").value.statements.body.first.accept(Compiler.new(self))
     end
 
