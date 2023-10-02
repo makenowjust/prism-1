@@ -22,14 +22,19 @@ module Prism
       end
   
       class Label
-        attr_reader :pcs
+        attr_reader :pcs, :splits
 
         def initialize
           @pcs = []
+          @splits = []
         end
 
-        def <<(pc)
+        def push_pc(pc)
           pcs << pc
+        end
+
+        def push_split(pc, type)
+          splits << [pc, type]
         end
       end
 
@@ -43,17 +48,94 @@ module Prism
 
       # in foo | bar
       def visit_alternation_pattern_node(node)
-        parent_failing = failing
-        @failing = Label.new
+        # First, find all of the clauses that are held by alternation pattern
+        # nodes. This will let us do further optimizations if there are more
+        # than 2.
+        clauses = [node.left, node.right]
+        while clauses.first.is_a?(AlternationPatternNode)
+          clause = clauses.shift
+          clauses.unshift(clause.left, clause.right)
+        end
 
-        visit(node.left)
-        vm.jump(passing)
+        # Next, we're going to check on the kinds of patterns that we're trying
+        # to compile. If it's possible to take advantage of checking the type
+        # only once, then we will do that.
+        groups =
+          clauses.group_by do |clause|
+            constant =
+              case clause.type
+              when :array_pattern_node, :find_pattern_node, :hash_pattern_node
+                clause.constant
+              when :constant_read_node, :constant_path_node
+                clause
+              end
 
-        vm.pushlabel(@failing)
-        @failing = parent_failing
-        visit(node.right)
+            if constant
+              parts = []
+              while constant.is_a?(ConstantPathNode)
+                parts.unshift(constant.child.name)
+                constant = constant.parent
+              end
+              parts.unshift(constant&.name)
+            else
+              :ungrouped
+            end
+          end
 
-        vm.jump(passing)
+        # If we have more than one group, we can do a special optimization where
+        # we check the type once and then jump to the correct clause.
+        if !groups.key?(:ungrouped) && groups.length > 1
+          # Next, transform the keys from constant paths to prism types so that
+          # we can use the .type method to switch effectively.
+          groups.transform_keys! do |path|
+            if ((path.length == 1) || (path.length == 2 && path[0] == :Prism)) && Prism.const_defined?(path.last, false)
+              Prism.const_get(path.last).type
+            else
+              path
+            end
+          end
+
+          # If we found a node type for every group, then we will perform our
+          # optimization.
+          if groups.keys.none? { |key| key.is_a?(Array) }
+            labels = groups.transform_values { Label.new }
+            vm.splittype(labels, failing)
+
+            groups.each do |type, clauses|
+              vm.pushlabel(labels[type])
+
+              if clauses.length > 1
+                parent_failing = failing
+
+                clauses.each do |clause|
+                  @failing = Label.new
+                  visit(clause)
+                  vm.jump(passing)
+                  vm.pushlabel(@failing)
+                end
+
+                @failing = parent_failing
+              else
+                visit(clauses.first)
+                vm.jump(passing)
+              end
+            end
+
+            return
+          end
+        else
+          parent_failing = failing
+          @failing = Label.new
+
+          visit(node.left)
+          vm.jump(passing)
+
+          vm.pushlabel(@failing)
+          @failing = parent_failing
+          visit(node.right)
+
+          vm.jump(passing)
+        end
       end
 
       # in [foo, bar, baz]
@@ -176,8 +258,11 @@ module Prism
         when :pop
           output << "%04d %-12s\n" % [pc, insn]
           pc += 1
+        when :splittype
+          output << "%04d %-12s %s, %04d\n" % [pc, insn, insns[pc + 1].inspect, insns[pc + 2]]
+          pc += 3
         else
-          binding.irb
+          raise "Unknown instruction: #{insn.inspect}"
         end
       end
 
@@ -217,6 +302,10 @@ module Prism
         when :pop
           stack.pop
           pc += 1
+        when :splittype
+          pc = insns[pc + 1].fetch(stack[-1].type, insns[pc + 2])
+        else
+          raise "Unknown instruction: #{insns[pc].inspect}"
         end
       end
 
@@ -225,12 +314,12 @@ module Prism
 
     def checklength(length, label)
       insns.push(:checklength, length, -1)
-      label << insns.length - 1
+      label.push_pc(insns.length - 1)
     end
 
     def checktype(type, label)
       insns.push(:checktype, type, -1)
-      label << insns.length - 1
+      label.push_pc(insns.length - 1)
     end
 
     def fail
@@ -239,7 +328,7 @@ module Prism
 
     def jump(label)
       insns.push(:jump, -1)
-      label << insns.length - 1
+      label.push_pc(insns.length - 1)
     end
 
     def pop
@@ -258,6 +347,16 @@ module Prism
       label.pcs.each do |pc|
         insns[pc] = insns.length
       end
+
+      label.splits.each do |(pc, type)|
+        insns[pc][type] = insns.length
+      end
+    end
+
+    def splittype(labels, label)
+      insns.push(:splittype, labels, label)
+      labels.each { |type, type_label| type_label.push_split(insns.length - 2, type) }
+      label.push_pc(insns.length - 1)
     end
   end
 end

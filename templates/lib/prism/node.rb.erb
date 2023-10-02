@@ -211,6 +211,11 @@ module Prism
     def type
       :<%= node.human %>
     end
+
+    # def self.type: () -> Symbol
+    def self.type
+      :<%= node.human %>
+    end
   end
   <%- end -%>
   <%- flags.each_with_index do |flag, flag_index| -%>
