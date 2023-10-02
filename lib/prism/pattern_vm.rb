@@ -181,7 +181,7 @@ module Prism
           end
         when :checkobject
           if insns[pc + 1] === stack[-1]
-            pc += 2
+            pc += 3
           else
             pc = insns[pc + 2]
           end
@@ -232,9 +232,9 @@ module Prism
       # Next, we're going to check on the kinds of patterns that we're trying
       # to compile. If it's possible to take advantage of checking the type
       # only once, then we will do that.
-      groups =
+      types =
         clauses.group_by do |clause|
-          constant =
+          constant_node =
             case clause.type
             when :array_pattern_node, :find_pattern_node, :hash_pattern_node
               clause.constant
@@ -242,56 +242,52 @@ module Prism
               clause
             end
 
-          if constant
-            constant_for(constant)
+          if constant_node
+            constant = constant_for(constant_node)
+            (constant < Node) ? constant.type : :ungrouped
           else
             :ungrouped
           end
         end
 
-      # If we have more than one group, we can do a special optimization where
+      # If we have more than one type, we can do a special optimization where
       # we check the type once and then jump to the correct clause.
-      if !groups.key?(:ungrouped) && groups.length > 1
-        # Next, transform the keys from constant paths to prism types so that
-        # we can use the .type method to switch effectively.
-        groups.transform_keys! do |key|
-          ((key != :ungrouped) && (key < Node)) ? key.type : key
-        end
+      if !types.key?(:ungrouped) && types.length > 1
+        labels = types.transform_values { label }
+        splittype(labels, failing)
 
-        # If we found a node type for every group, then we will perform our
-        # optimization.
-        if groups.keys.none? { |key| key == :ungrouped || !key.is_a?(Symbol) }
-          labels = groups.transform_values { label }
-          splittype(labels, failing)
+        types.each do |type, clauses|
+          pushlabel(labels[type])
 
-          groups.each do |type, clauses|
-            pushlabel(labels[type])
+          parent_failing = failing
+          parent_checking_type = checking_type
+          @checking_type = false
 
-            parent_failing = failing
-            parent_checking_type = checking_type
-            @checking_type = false
+          last_index = clauses.length - 1
+          clauses.each_with_index do |clause, index|
+            @failing = label if index != last_index
 
-            last_index = clauses.length - 1
-            clauses.each_with_index do |clause, index|
-              @failing = label if index != last_index
-
-              case clause.type
-              when :constant_path_node, :constant_read_node
-              else
-                visit(clause)
-              end
-
-              jump(passing)
-              pushlabel(@failing) if index != last_index
+            # We don't need to check the type since we're explicitly splitting
+            # on type already. In this case for constant nodes we can skip
+            # visiting those nodes entirely. For other nodes, we'll rely on the
+            # @checking_type flag to skip the check.
+            case clause.type
+            when :constant_path_node, :constant_read_node
+            else
+              visit(clause)
             end
 
-            @failing = parent_failing
-            @checking_type = parent_checking_type
+            jump(passing)
+            pushlabel(@failing) if index != last_index
           end
 
-          return
+          @failing = parent_failing
+          @checking_type = parent_checking_type
         end
       else
+        # If there is an ungrouped type or there is only a single type, there's
+        # no benefit to calling the #type method, so we'll compile as normal.
+        # We do this by first checking the left, then checking the right.
         parent_failing = failing
         @failing = label
 
@@ -407,7 +403,8 @@ module Prism
       jump(passing)
     end
 
-    # foo in bar
+    # This is effectively our entrypoint into the compiler since we always
+    # compile one of these nodes as the top-level node in our expression.
     def visit_match_predicate_node(node)
       @passing = label
       @failing = label
@@ -428,6 +425,22 @@ module Prism
     # in nil
     def visit_nil_node(node)
       checknil(failing)
+    end
+
+    # in 0..10
+    def visit_range_node(node)
+      bounds =
+        [node.left, node.right].map do |bound|
+          case bound
+          when nil, NilNode
+          when IntegerNode
+            bound.value
+          else
+            raise CompilationError, node.inspect
+          end
+        end
+
+      checkobject(Range.new(*bounds, node.exclude_end?), failing)
     end
 
     # in /abc/
@@ -583,13 +596,25 @@ module Prism
     # Accept a label and find the label that it should actually be jumping to
     # in case of a jump->jump sequence.
     def follow_jump(label)
-      index = insns.index(label)
+      following = true
+      current = label
 
-      if insns[index + 1] == :jump
-        follow_jump(insns[index + 2])
-      else
-        label
+      while following
+        following = false
+
+        each_insn do |pc, insn|
+          if insn == label
+            if insns[pc + 1] == :jump && insns[pc + 2] != current
+              current = insns[pc + 2]
+              following = true
+            end
+
+            break
+          end
+        end
       end
+
+      current
     end
 
     # Accepts a PC that refers to a label and finds the label that it should
