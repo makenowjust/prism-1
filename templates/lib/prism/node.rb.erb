@@ -216,6 +216,37 @@ module Prism
     def self.type
       :<%= node.human %>
     end
+
+    def self.field(name)
+      case name
+      <%- node.fields.each do |field| -%>
+      <%- case field -%>
+      <%- when Prism::NodeField -%>
+      when :<%= field.name %> then ({ type: :node, kind: <%= field.options.fetch(:kind, "Node") %> })
+      <%- when Prism::OptionalNodeField -%>
+      when :<%= field.name %> then ({ type: :optional_node, kind: <%= field.options.fetch(:kind, "Node") %> })
+      <%- when Prism::NodeListField -%>
+      when :<%= field.name %> then ({ type: :node_list })
+      <%- when Prism::StringField -%>
+      when :<%= field.name %> then ({ type: :string })
+      <%- when Prism::ConstantField -%>
+      when :<%= field.name %> then ({ type: :constant })
+      <%- when Prism::OptionalConstantField -%>
+      when :<%= field.name %> then ({ type: :optional_constant })
+      <%- when Prism::ConstantListField -%>
+      when :<%= field.name %> then ({ type: :constant_list })
+      <%- when Prism::LocationField -%>
+      when :<%= field.name %> then ({ type: :location })
+      <%- when Prism::OptionalLocationField -%>
+      when :<%= field.name %> then ({ type: :optional_location })
+      <%- when Prism::UInt32Field -%>
+      when :<%= field.name %> then ({ type: :uint32 })
+      <%- when Prism::FlagsField -%>
+      when :<%= field.name %> then ({ type: :flags, kind: <%= field.options.fetch(:kind, "Node") %> })
+      <%- end -%>
+      <%- end -%>
+      end
+    end
   end
   <%- end -%>
   <%- flags.each_with_index do |flag, flag_index| -%>
