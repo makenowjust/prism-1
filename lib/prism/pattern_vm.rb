@@ -41,6 +41,21 @@ module Prism
         @failing = nil
       end
 
+      # in foo | bar
+      def visit_alternation_pattern_node(node)
+        parent_failing = failing
+        @failing = Label.new
+
+        visit(node.left)
+        vm.jump(passing)
+
+        vm.pushlabel(@failing)
+        @failing = parent_failing
+        visit(node.right)
+
+        vm.jump(passing)
+      end
+
       # in [foo, bar, baz]
       def visit_array_pattern_node(node)
         compile_error(node) if node.constant || !node.rest.nil? || node.posts.any?
