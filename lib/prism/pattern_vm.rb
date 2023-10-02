@@ -262,7 +262,7 @@ module Prism
 
       # in nil
       def visit_nil_node(node)
-        vm.checkobject(nil, failing)
+        vm.checknil(failing)
       end
 
       # in /abc/
@@ -373,7 +373,7 @@ module Prism
             pc += 2
           when :pushfield, :pushindex
             pc += 2
-          when :checklength, :checkobject, :checktype
+          when :checklength, :checknil, :checkobject, :checktype
             optimize_jump(pc + 1)
             pc += 3
           when :splittype
@@ -402,7 +402,7 @@ module Prism
             pc += 1
           when :jump, :pushfield, :pushindex
             pc += 2
-          when :checklength, :checkobject, :checktype, :splittype
+          when :checklength, :checknil, :checkobject, :checktype, :splittype
             pc += 3
           else
             if insn.is_a?(Compiler::Label)
@@ -475,6 +475,9 @@ module Prism
         when :checklength
           output << "%04d %-12s %d, %04d\n" % [pc, insn, insns[pc + 1], insns[pc + 2]]
           pc += 3
+        when :checknil
+          output << "%04d %-12s %04d\n" % [pc, insn, insns[pc + 1]]
+          pc += 2
         when :checkobject
           output << "%04d %-12s %s, %04d\n" % [pc, insn, insns[pc + 1].inspect, insns[pc + 2]]
           pc += 3
@@ -521,6 +524,12 @@ module Prism
           else
             pc = insns[pc + 2]
           end
+        when :checknil
+          if stack[-1].nil?
+            pc += 2
+          else
+            pc = insns[pc + 1]
+          end
         when :checkobject
           if insns[pc + 1] === stack[-1]
             pc += 2
@@ -562,6 +571,11 @@ module Prism
 
     def checklength(length, label)
       insns.push(:checklength, length, label)
+      label.push_jump(insns.length - 1)
+    end
+
+    def checknil(label)
+      insns.push(:checknil, label)
       label.push_jump(insns.length - 1)
     end
 
