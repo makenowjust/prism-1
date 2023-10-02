@@ -53,9 +53,11 @@ module Prism
     # where they should actually be jumping to. Once we do, we can replace the
     # label with the correct PC.
     class Label
+      attr_accessor :pc
       attr_reader :jumps, :splits
 
       def initialize
+        @pc = -1
         @jumps = []
         @splits = []
       end
@@ -554,6 +556,7 @@ module Prism
     end
 
     def pushlabel(label)
+      label.pc = insns.length
       insns.push(label)
     end
 
@@ -567,121 +570,33 @@ module Prism
     # These methods are used to optimize/finalize bytecode.                    #
     ############################################################################
 
-    # Iterate over each instruction in the bytecode.
-    def each_insn
-      pc = 0
-      max_pc = insns.length
-
-      while pc < max_pc
-        insn = insns[pc]
-        yield pc, insn
-
-        case insn
-        when :fail, :pop
-          pc += 1
-        when :jump, :pushfield, :pushindex
-          pc += 2
-        when :checklength, :checknil, :checkobject, :checktype, :splittype
-          pc += 3
-        else
-          if insn.is_a?(Label)
-            pc += 1
-          else
-            raise "Unknown instruction: #{insn.inspect}"
-          end
-        end
-      end
-    end
-
-    # Accept a label and find the label that it should actually be jumping to
-    # in case of a jump->jump sequence.
-    def follow_jump(label)
-      following = true
-      current = label
-
-      while following
-        following = false
-
-        each_insn do |pc, insn|
-          if insn == label
-            if insns[pc + 1] == :jump && insns[pc + 2] != current
-              current = insns[pc + 2]
-              following = true
-            end
-
-            break
-          end
-        end
-      end
-
-      current
-    end
-
-    # Accepts a PC that refers to a label and finds the label that it should
-    # actually be jumping to in case of a jump->jump sequence.
-    def optimize_jump(pc)
-      old_label = insns[pc]
-      new_label = follow_jump(old_label)
-
-      if old_label != new_label
-        old_label.jumps.delete(pc)
-        new_label.jumps.push(pc)
-        insns[pc] = new_label
-      end
-    end
-
-    # Accepts a PC that refers to a split label hash and finds the labels that
-    # they should actually be jumping to in case of a jump->jump sequence.
-    def optimize_split(pc)
-      split = insns[pc]
-      split.each do |type, old_label|
-        new_label = follow_jump(old_label)
-
-        if old_label != new_label
-          key = [pc, type]
-
-          old_label.splits.delete(key)
-          new_label.splits.push(key)
-
-          split[type] = new_label
-        end
-      end
-    end
-
-    # Make a pass over the instructions to eliminate jump->jump sequences.
+    # Make a pass over the labels to eliminate jump->jump sequences.
     def optimize_jumps
-      each_insn do |pc, insn|
-        case insn
-        when :jump
-          optimize_jump(pc + 1)
-        when :checklength, :checknil, :checkobject, :checktype
-          optimize_jump(pc + 1)
-        when :splittype
-          optimize_split(pc + 1)
-          optimize_jump(pc + 2)
+      labels.each do |label|
+        current = label
+
+        while insns[current.pc + 1] == :jump && insns[current.pc + 2] != current
+          current = insns[current.pc + 2]
+        end
+
+        if current != label
+          current.jumps.concat(label.jumps)
+          label.jumps.clear
+
+          current.splits.concat(label.splits)
+          label.splits.clear
         end
       end
     end
 
     # Replace all of the labels in the bytecode with their corresponding PCs.
     def link_labels
-      # First, we need to find all of the PCs in the list of instructions and
-      # track where they are to find their current PCs.
-      old_pcs = {}
-      each_insn do |pc, insn|
-        if insn.is_a?(Label)
-          (old_pcs[pc] ||= []) << insn
-        end
-      end
-
-      # Next, we need to find their new PCs by accounting for them being
-      # removed from the list of instructions.
-      old_pcs.transform_keys!.with_index { |key, index| key - index }
-
-      # Next, set up the new list of labels to point to the correct PCs.
+      # First, we'll group the labels by PC, then transform the PCs into their
+      # new PCs.
       new_pcs = {}
-      old_pcs.each do |pc, labels|
-        labels.each { |label| new_pcs[label] = pc }
+      labels.group_by(&:pc).to_a.sort!.each_with_index do |(old_pc, labels), index|
+        new_pc = old_pc - index
+        labels.each { |label| new_pcs[label] = new_pc }
       end
 
       # Next, we need to go back and patch the instructions where we should be
