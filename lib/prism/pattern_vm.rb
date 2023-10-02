@@ -232,12 +232,7 @@ module Prism
             end
 
           if constant
-            parts = []
-            while constant.is_a?(ConstantPathNode)
-              parts.unshift(constant.child.name)
-              constant = constant.parent
-            end
-            parts.unshift(constant&.name)
+            constant_for(constant)
           else
             :ungrouped
           end
@@ -248,17 +243,13 @@ module Prism
       if !groups.key?(:ungrouped) && groups.length > 1
         # Next, transform the keys from constant paths to prism types so that
         # we can use the .type method to switch effectively.
-        groups.transform_keys! do |path|
-          if ((path.length == 1) || (path.length == 2 && path[0] == :Prism)) && Prism.const_defined?(path.last, false)
-            Prism.const_get(path.last).type
-          else
-            path
-          end
+        groups.transform_keys! do |key|
+          ((key != :ungrouped) && (key < Node)) ? key.type : key
         end
 
         # If we found a node type for every group, then we will perform our
         # optimization.
-        if groups.keys.none? { |key| key.is_a?(Array) }
+        if groups.keys.none? { |key| key == :ungrouped || !key.is_a?(Symbol) }
           labels = groups.transform_values { label }
           splittype(labels, failing)
 
