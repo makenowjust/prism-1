@@ -104,24 +104,25 @@ module Prism
             groups.each do |type, clauses|
               vm.pushlabel(labels[type])
 
-              if clauses.length > 1
-                *first_clauses, last_clause = clauses
-                parent_failing = failing
+              parent_failing = failing
+              last_index = clauses.length - 1
 
-                first_clauses.each do |clause|
-                  @failing = vm.label
+              clauses.each_with_index do |clause, index|
+                @failing = vm.label if index != last_index
+
+                case clause.type
+                when :array_pattern_node, :find_pattern_node, :hash_pattern_node
+                  visit(clause.copy(constant: nil))
+                when :constant_read_node, :constant_path_node
+                else
                   visit(clause)
-                  vm.jump(passing)
-                  vm.pushlabel(@failing)
                 end
 
-                @failing = parent_failing
-                visit(last_clause)
                 vm.jump(passing)
-              else
-                visit(clauses.first)
-                vm.jump(passing)
+                vm.pushlabel(@failing) if index != last_index
               end
+
+              @failing = parent_failing
             end
 
             return
