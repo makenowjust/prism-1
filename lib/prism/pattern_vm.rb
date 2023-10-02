@@ -20,6 +20,27 @@ module Prism
       end
     end
 
+    # Raised when a constant path is used that is not understood.
+    class NameError < StandardError
+      def initialize(name)
+        super(<<~ERROR)
+          prism was unable to find the constant that you provided. It failed on
+          the constant path:
+
+          #{name}
+
+          Note that not all constant paths are supported by prism's patterns.
+          If you're using some constant path that you believe should be
+          supported, please open an issue on GitHub at
+          https://github.com/ruby/prism/issues/new.
+        ERROR
+      end
+    end
+
+    # A label is a placeholder for a jump instruction. While building our set of
+    # instructions, they are placed into the list of instructions until we know
+    # where they should actually be jumping to. Once we do, we can replace the
+    # label with the correct PC.
     class Label
       attr_reader :jumps, :splits
 
@@ -37,8 +58,18 @@ module Prism
       end
     end
 
+    # The pattern that this VM is compiling. This is represented as a string
+    # with a valid Ruby pattern matching expressions.
     attr_reader :pattern
-    attr_reader :insns, :labels
+
+    # The list of instructions that this VM has compiled. This is an array of
+    # symbols and objects that represent the flow of the bytecode.
+    attr_reader :insns
+
+    # The list of labels that this VM has compiled. This is an array of labels
+    # that are used to represent jumps in the bytecode.
+    attr_reader :labels
+
     attr_reader :checking_type, :passing, :failing
 
     def initialize(pattern)
@@ -56,15 +87,21 @@ module Prism
     # These methods are the public API of the pattern class.                   #
     ############################################################################
 
+    # Combine two patterns together into a new pattern that will match either
+    # of the two patterns.
     def or(other)
       PatternVM.new("#{pattern} | #{other.pattern}")
     end
     alias | or
 
+    # Compile the pattern into a set of instructions that can be used to match
+    # against nodes.
     def compile
       visit(Prism.parse("nil in #{pattern}").value.statements.body.first)
     end
 
+    # Disassemble the instructions that this VM has compiled into a
+    # human-readable format.
     def disasm
       output = +""
       pc = 0
@@ -109,6 +146,8 @@ module Prism
       output
     end
 
+    # Run the instructions that this VM has compiled against a node. This will
+    # return true if the node matches the pattern and false if it does not.
     def run(node)
       stack = [node]
 
@@ -171,8 +210,8 @@ module Prism
     # in foo | bar
     def visit_alternation_pattern_node(node)
       # First, find all of the clauses that are held by alternation pattern
-      # nodes. This will let us do further optimizations if there are more
-      # than 2.
+      # nodes. This will let us do further optimizations if we can split on a
+      # common check.
       clauses = [node.left, node.right]
       while clauses.first.is_a?(AlternationPatternNode)
         clause = clauses.shift
@@ -267,9 +306,18 @@ module Prism
 
     # in [foo, bar, baz]
     def visit_array_pattern_node(node)
-      compile_error(node) if node.constant || !node.rest.nil? || node.posts.any?
+      if !node.rest.nil? || node.posts.any?
+        raise CompilationError, node.inspect
+      end
 
-      checktype(Array, failing) if checking_type
+      if checking_type
+        if node.constant
+          visit(node.constant)
+        else
+          checktype(Array, failing)
+        end
+      end
+
       checklength(node.requireds.length, failing)
 
       parent_checking_type = checking_type
@@ -291,39 +339,26 @@ module Prism
         pushfield(node.key.value.to_sym)
         visit(node.value)
       else
-        compile_error(node)
+        raise CompilationError, node.inspect
       end
     end
 
     # in Prism::ConstantReadNode
     def visit_constant_path_node(node)
-      parent = node.parent
-
-      if parent.is_a?(ConstantReadNode) && parent.slice == "Prism"
-        visit(node.child)
-      else
-        compile_error(node)
-      end
+      checktype(constant_for(node), failing)
     end
 
     # in ConstantReadNode
     # in String
     def visit_constant_read_node(node)
-      value = node.slice
-
-      if Prism.const_defined?(value, false)
-        checktype(Prism.const_get(value), failing)
-      elsif Object.const_defined?(value, false)
-        checktype(Object.const_get(value), failing)
-      else
-        compile_error(node)
-      end
+      checktype(constant_for(node), failing)
     end
 
     # in InstanceVariableReadNode[name: Symbol]
     # in { name: Symbol }
     def visit_hash_pattern_node(node)
       constant = nil
+
       if node.constant
         constant = constant_for(node.constant)
         visit(node.constant) if checking_type
@@ -333,29 +368,29 @@ module Prism
       node.assocs.each do |assoc|
         @checking_type = true
 
-        if assoc.is_a?(AssocNode)
-          key = assoc.key.value.to_sym
+        unless assoc.is_a?(AssocNode)
+          raise CompilationError, assoc.inspect
+        end
 
-          field = constant.field(key)
-          if field
-            case field[:type]
-            when :node_list
-              if assoc.value.is_a?(ArrayPatternNode)
-                @checking_type = false
-                visit(assoc)
-                pop
-              else
-                compile_error(assoc.value)
-              end
-            else
+        key = assoc.key.value.to_sym
+
+        if (field = constant&.field(key))
+          case field[:type]
+          when :node_list
+            if assoc.value.is_a?(ArrayPatternNode)
+              @checking_type = false
               visit(assoc)
               pop
+            else
+              raise CompilationError, assoc.value.inspect
             end
           else
-            compile_error(assoc.key)
+            visit(assoc)
+            pop
           end
         else
-          compile_error(assoc)
+          visit(assoc)
+          pop
         end
       end
 
@@ -403,42 +438,41 @@ module Prism
 
     private
 
-    # Raise an error when we encounter a node that we don't know how to compile.
-    def compile_error(node)
-      raise CompilationError, node.inspect
-    end
-
     # Return the constant that a node represents.
     def constant_for(node)
+      # First, gather up all of the parts of the constant. This makes an array
+      # of symbols representing each part.
       parts = []
-      while node.is_a?(ConstantPathNode)
-        parts.unshift(node.child.name)
-        node = node.parent
-      end
-      parts.unshift(node&.name || :Object)
+      current = node
 
-      case parts.length
-      when 1
-        if Prism.const_defined?(parts[0], false)
-          Prism.const_get(parts[0])
-        else
-          compile_error(node)
-        end
-      when 2
-        if parts[0] == :Prism && Prism.const_defined?(parts[1], false)
-          Prism.const_get(parts[1])
-        else
-          compile_error(node)
-        end
-      when 3
-        if parts[0] == :Object && parts[1] == :Pattern && Prism.const_defined?(parts[2], false)
-          Prism.const_get(parts[2])
-        else
-          compile_error(node)
-        end
-      else
-        compile_error(node)
+      while current.is_a?(ConstantPathNode)
+        parts.unshift(current.child.name)
+        current = current.parent
       end
+
+      # Unshift the base constant onto the parts array. This is either going to
+      # be a constant read or the implicit object base.
+      parts.unshift(current.name) if current
+
+      # Next, check if there's only one part and that it matches a prism
+      # constant. We do this as a nice shortcut to allow you to specify a node
+      # name without having to prefix it with Prism::.
+      if parts.length == 1 && Prism.const_defined?(parts[0], false)
+        return Prism.const_get(parts[0])
+      end
+
+      # Otherwise, attempt to check the constant path.
+      current = Object
+      parts.each do |part|
+        if current.const_defined?(part, false)
+          current = current.const_get(part)
+        else
+          raise NameError, parts.join("::")
+        end
+      end
+
+      # Finally, return the constant that we found.
+      current
     end
 
     # Generic visit method for any kind of node.
@@ -581,6 +615,7 @@ module Prism
       end
     end
 
+    # Replace all of the labels in the bytecode with their corresponding PCs.
     def link_labels
       # First, we need to find all of the PCs in the list of instructions and
       # track where they are to find their current PCs.
