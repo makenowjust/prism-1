@@ -20,6 +20,17 @@ module Prism
       end
     end
 
+    # Raised when a field is attempting to be matched by a pattern that will
+    # never be possible based prism's configuration.
+    class IncompatibleFieldError < StandardError
+      def initialize(field, type)
+        super(<<~ERROR)
+          prism was unable to compile the pattern you provided into a usable
+          expression because the #{field} field can never be matched by #{type}.
+        ERROR
+      end
+    end
+
     # Raised when a constant path is used that is not understood.
     class NameError < StandardError
       def initialize(name)
@@ -324,16 +335,6 @@ module Prism
       jump(passing)
     end
 
-    # name: Symbol
-    def visit_assoc_node(node)
-      if node.key.is_a?(Prism::SymbolNode)
-        pushfield(node.key.value.to_sym)
-        visit(node.value)
-      else
-        raise CompilationError, node.inspect
-      end
-    end
-
     # in Prism::ConstantReadNode
     def visit_constant_path_node(node)
       checktype(constant_for(node), failing)
@@ -352,35 +353,52 @@ module Prism
 
       if node.constant
         constant = constant_for(node.constant)
+
+        # We only support further deconstruction of hashes if they are prism
+        # nodes. Otherwise we don't know how to make sense of them.
+        unless constant < Node
+          raise CompilationError, node.constant.inspect
+        end
+
         visit(node.constant) if checking_type
       end
 
       parent_checking_type = checking_type
+
+      # For each of the elements in the hash, we're going to push the field onto
+      # the stack and then check its value.
       node.assocs.each do |assoc|
         @checking_type = true
 
+        # We only support assoc nodes. The other option is a keyword splat node,
+        # which doesn't make sense in this context.
         unless assoc.is_a?(AssocNode)
           raise CompilationError, assoc.inspect
         end
 
+        # The only way to have a pattern matching key is for it to be a symbol.
+        # So in this case we are safe to assume the interface.
         key = assoc.key.value.to_sym
 
         if (field = constant&.field(key))
           case field[:type]
-          when :node_list
+          when :constant_list, :node_list
             if assoc.value.is_a?(ArrayPatternNode)
               @checking_type = false
-              visit(assoc)
+              pushfield(key)
+              visit(assoc.value)
               pop
             else
-              raise CompilationError, assoc.value.inspect
+              raise IncompatibleFieldError.new("#{constant}##{key}", assoc.value.inspect)
             end
           else
-            visit(assoc)
+            pushfield(key)
+            visit(assoc.value)
             pop
           end
         else
-          visit(assoc)
+          pushfield(key)
+          visit(assoc.value)
           pop
         end
       end
