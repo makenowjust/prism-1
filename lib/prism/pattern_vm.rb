@@ -259,6 +259,26 @@ module Prism
         vm.reify!
       end
 
+      # in nil
+      def visit_nil_node(node)
+        vm.checkobject(nil, failing)
+      end
+
+      # in /abc/
+      def visit_regular_expression_node(node)
+        vm.checkobject(Regexp.new(node.content, node.closing[1..]), failing)
+      end
+
+      # in "foo"
+      def visit_string_node(node)
+        vm.checkobject(node.unescaped, failing)
+      end
+
+      # in :foo
+      def visit_symbol_node(node)
+        vm.checkobject(node.value.to_sym, failing)
+      end
+
       private
   
       def compile_error(node)
@@ -341,7 +361,7 @@ module Prism
           pc += 2
         when :pushfield, :pushindex
           pc += 2
-        when :checklength, :checktype
+        when :checklength, :checkobject, :checktype
           # insns[pc + 1] is the failing label
           pc += 3
         when :splittype
@@ -374,7 +394,7 @@ module Prism
           pc += 1
         when :jump, :pushfield, :pushindex
           pc += 2
-        when :checklength, :checktype, :splittype
+        when :checklength, :checkobject, :checktype, :splittype
           pc += 3
         else
           if insn.is_a?(Compiler::Label)
@@ -424,6 +444,9 @@ module Prism
         when :checklength
           output << "%04d %-12s %d, %04d\n" % [pc, insn, insns[pc + 1], insns[pc + 2]]
           pc += 3
+        when :checkobject
+          output << "%04d %-12s %s, %04d\n" % [pc, insn, insns[pc + 1].inspect, insns[pc + 2]]
+          pc += 3
         when :checktype
           output << "%04d %-12s %s, %04d\n" % [pc, insn, insns[pc + 1], insns[pc + 2]]
           pc += 3
@@ -467,6 +490,12 @@ module Prism
           else
             pc = insns[pc + 2]
           end
+        when :checkobject
+          if insns[pc + 1] === stack[-1]
+            pc += 2
+          else
+            pc = insns[pc + 2]
+          end
         when :checktype
           if stack[-1].is_a?(insns[pc + 1])
             pc += 3
@@ -498,6 +527,11 @@ module Prism
 
     def checklength(length, label)
       insns.push(:checklength, length, label)
+      label.push_jump(insns.length - 1)
+    end
+
+    def checkobject(object, label)
+      insns.push(:checkobject, object, label)
       label.push_jump(insns.length - 1)
     end
 
