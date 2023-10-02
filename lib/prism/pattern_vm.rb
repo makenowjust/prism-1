@@ -22,15 +22,15 @@ module Prism
       end
   
       class Label
-        attr_reader :pcs, :splits
+        attr_reader :jumps, :splits
 
         def initialize
-          @pcs = []
+          @jumps = []
           @splits = []
         end
 
-        def push_pc(pc)
-          pcs << pc
+        def push_jump(pc)
+          jumps << pc
         end
 
         def push_split(pc, type)
@@ -98,23 +98,26 @@ module Prism
           # If we found a node type for every group, then we will perform our
           # optimization.
           if groups.keys.none? { |key| key.is_a?(Array) }
-            labels = groups.transform_values { Label.new }
+            labels = groups.transform_values { vm.label }
             vm.splittype(labels, failing)
 
             groups.each do |type, clauses|
               vm.pushlabel(labels[type])
 
               if clauses.length > 1
+                *first_clauses, last_clause = clauses
                 parent_failing = failing
 
-                clauses.each do |clause|
-                  @failing = Label.new
+                first_clauses.each do |clause|
+                  @failing = vm.label
                   visit(clause)
                   vm.jump(passing)
                   vm.pushlabel(@failing)
                 end
 
                 @failing = parent_failing
+                visit(last_clause)
+                vm.jump(passing)
               else
                 visit(clauses.first)
                 vm.jump(passing)
@@ -125,7 +128,7 @@ module Prism
           end
         else
           parent_failing = failing
-          @failing = Label.new
+          @failing = vm.label
 
           visit(node.left)
           vm.jump(passing)
@@ -204,8 +207,8 @@ module Prism
   
       # foo in bar
       def visit_match_predicate_node(node)
-        @passing = Label.new
-        @failing = Label.new
+        @passing = vm.label
+        @failing = vm.label
 
         visit(node.pattern)
 
@@ -215,6 +218,8 @@ module Prism
         vm.pushlabel(@passing)
         @passing = nil
         @failing = nil
+
+        vm.reify!
       end
 
       private
@@ -224,11 +229,66 @@ module Prism
       end
     end
 
-    attr_reader :insns
+    attr_reader :insns, :labels
 
     def initialize(pattern)
       @insns = []
+      @labels = []
       Prism.parse("nil in #{pattern}").value.statements.body.first.accept(Compiler.new(self))
+    end
+
+    def reify!
+      # First, we need to find all of the PCs in the list of instructions and
+      # track where they are to find their current PCs.
+      pc = 0
+      max_pc = insns.length
+
+      pcs = {}
+      while pc < max_pc
+        case (insn = insns[pc])
+        when :fail, :pop
+          pc += 1
+        when :jump, :pushfield, :pushindex
+          pc += 2
+        when :checklength, :checktype, :splittype
+          pc += 3
+        else
+          if insn.is_a?(Compiler::Label)
+            (pcs[pc] ||= []) << insn
+            pc += 1
+          else
+            raise "Unknown instruction: #{insn.inspect}"
+          end
+        end
+      end
+
+      # Next, we need to find their new PCs by accounting for them being removed
+      # from the list of instructions.
+      pcs.transform_keys!.with_index do |key, index|
+        key - index
+      end
+
+      # Next, set up the new list of labels to point to the correct PCs.
+      pcs = pcs.each_with_object({}) do |(pc, labels), result|
+        labels.each do |label|
+          result[label] = pc
+        end
+      end
+
+      # Next, we need to go back and patch the instructions where we should be
+      # jumping to labels to point to the correct PC.
+      labels.each do |label|
+        label.jumps.each do |pc|
+          insns[pc] = pcs[label]
+        end
+
+        label.splits.each do |(pc, type)|
+          insns[pc][type] = pcs[label]
+        end
+      end
+
+      # Finally, we can remove all of the labels from the list of instructions.
+      insns.reject! { |insn| insn.is_a?(Compiler::Label) }
     end
 
     def disasm
@@ -314,12 +374,12 @@ module Prism
 
     def checklength(length, label)
       insns.push(:checklength, length, -1)
-      label.push_pc(insns.length - 1)
+      label.push_jump(insns.length - 1)
     end
 
     def checktype(type, label)
       insns.push(:checktype, type, -1)
-      label.push_pc(insns.length - 1)
+      label.push_jump(insns.length - 1)
     end
 
     def fail
@@ -328,7 +388,13 @@ module Prism
 
     def jump(label)
       insns.push(:jump, -1)
-      label.push_pc(insns.length - 1)
+      label.push_jump(insns.length - 1)
+    end
+
+    def label
+      new_label = Compiler::Label.new
+      labels << new_label
+      new_label
     end
 
     def pop
@@ -344,19 +410,13 @@ module Prism
     end
 
     def pushlabel(label)
-      label.pcs.each do |pc|
-        insns[pc] = insns.length
-      end
-
-      label.splits.each do |(pc, type)|
-        insns[pc][type] = insns.length
-      end
+      insns.push(label)
     end
 
     def splittype(labels, label)
       insns.push(:splittype, labels, label)
       labels.each { |type, type_label| type_label.push_split(insns.length - 2, type) }
-      label.push_pc(insns.length - 1)
+      label.push_jump(insns.length - 1)
     end
   end
 end
