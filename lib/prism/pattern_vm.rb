@@ -38,10 +38,11 @@ module Prism
         end
       end
 
-      attr_reader :vm, :passing, :failing
+      attr_reader :vm, :checktype, :passing, :failing
   
       def initialize(vm)
         @vm = vm
+        @checktype = true
         @passing = nil
         @failing = nil
       end
@@ -105,15 +106,15 @@ module Prism
               vm.pushlabel(labels[type])
 
               parent_failing = failing
-              last_index = clauses.length - 1
+              parent_checktype = checktype
+              @checktype = false
 
+              last_index = clauses.length - 1
               clauses.each_with_index do |clause, index|
                 @failing = vm.label if index != last_index
 
                 case clause.type
-                when :array_pattern_node, :find_pattern_node, :hash_pattern_node
-                  visit(clause.copy(constant: nil))
-                when :constant_read_node, :constant_path_node
+                when :constant_path_node, :constant_read_node
                 else
                   visit(clause)
                 end
@@ -123,6 +124,7 @@ module Prism
               end
 
               @failing = parent_failing
+              @checktype = parent_checktype
             end
 
             return
@@ -146,15 +148,19 @@ module Prism
       def visit_array_pattern_node(node)
         compile_error(node) if node.constant || !node.rest.nil? || node.posts.any?
   
-        vm.checktype(Array, failing)
+        vm.checktype(Array, failing) if checktype
         vm.checklength(node.requireds.length, failing)
   
+        parent_checktype = checktype
+        @checktype = true
+
         node.requireds.each_with_index do |required, index|
           vm.pushindex(index)
           visit(required)
           vm.pop
         end
   
+        @checktype = parent_checktype
         vm.jump(passing)
       end
   
@@ -196,13 +202,43 @@ module Prism
       # in InstanceVariableReadNode[name: Symbol]
       # in { name: Symbol }
       def visit_hash_pattern_node(node)
-        visit(node.constant) if node.constant
-  
-        node.assocs.each do |assoc|
-          visit(assoc)
-          vm.pop
+        constant = nil
+        if node.constant
+          constant = node_constant(node.constant)
+          visit(node.constant) if checktype
         end
-  
+
+        parent_checktype = checktype
+        node.assocs.each do |assoc|
+          @checktype = true
+
+          if assoc.is_a?(AssocNode)
+            key = assoc.key.value.to_sym
+
+            field = constant.field(key)
+            if field
+              case field[:type]
+              when :node_list
+                if assoc.value.is_a?(ArrayPatternNode)
+                  @checktype = false
+                  visit(assoc)
+                  vm.pop
+                else
+                  compile_error(assoc.value)
+                end
+              else
+                visit(assoc)
+                vm.pop
+              end
+            else
+              compile_error(assoc.key)
+            end
+          else
+            compile_error(assoc)
+          end
+        end
+
+        @checktype = parent_checktype
         vm.jump(passing)
       end
   
@@ -227,6 +263,38 @@ module Prism
   
       def compile_error(node)
         raise CompilationError, node.inspect
+      end
+
+      def node_constant(node)
+        parts = []
+        while node.is_a?(ConstantPathNode)
+          parts.unshift(node.child.name)
+          node = node.parent
+        end
+        parts.unshift(node&.name || :Object)
+
+        case parts.length
+        when 1
+          if Prism.const_defined?(parts[0], false)
+            Prism.const_get(parts[0])
+          else
+            compile_error(node)
+          end
+        when 2
+          if parts[0] == :Prism && Prism.const_defined?(parts[1], false)
+            Prism.const_get(parts[1])
+          else
+            compile_error(node)
+          end
+        when 3
+          if parts[0] == :Object && parts[1] == :Pattern && Prism.const_defined?(parts[2], false)
+            Prism.const_get(parts[2])
+          else
+            compile_error(node)
+          end
+        else
+          compile_error(node)
+        end
       end
     end
 
