@@ -21,18 +21,32 @@ module Prism
         end
       end
   
-      attr_reader :vm
+      class Label
+        attr_reader :pcs
+
+        def initialize
+          @pcs = []
+        end
+
+        def <<(pc)
+          pcs << pc
+        end
+      end
+
+      attr_reader :vm, :passing, :failing
   
       def initialize(vm)
         @vm = vm
+        @passing = nil
+        @failing = nil
       end
-  
+
       # in [foo, bar, baz]
       def visit_array_pattern_node(node)
         compile_error(node) if node.constant || !node.rest.nil? || node.posts.any?
   
-        vm.checktype(Array)
-        vm.checklength(node.requireds.length)
+        vm.checktype(Array, failing)
+        vm.checklength(node.requireds.length, failing)
   
         node.requireds.each_with_index do |required, index|
           vm.pushindex(index)
@@ -40,7 +54,7 @@ module Prism
           vm.pop
         end
   
-        vm.match
+        vm.jump(passing)
       end
   
       # name: Symbol
@@ -70,9 +84,9 @@ module Prism
         value = node.slice
   
         if Prism.const_defined?(value, false)
-          vm.checktype(Prism.const_get(value))
+          vm.checktype(Prism.const_get(value), failing)
         elsif Object.const_defined?(value, false)
-          vm.checktype(Object.const_get(value))
+          vm.checktype(Object.const_get(value), failing)
         else
           compile_error(node)
         end
@@ -88,9 +102,24 @@ module Prism
           vm.pop
         end
   
-        vm.match
+        vm.jump(passing)
       end
   
+      # foo in bar
+      def visit_match_predicate_node(node)
+        @passing = Label.new
+        @failing = Label.new
+
+        visit(node.pattern)
+
+        vm.pushlabel(@failing)
+        vm.fail
+
+        vm.pushlabel(@passing)
+        @passing = nil
+        @failing = nil
+      end
+
       private
   
       def compile_error(node)
@@ -102,21 +131,68 @@ module Prism
 
     def initialize(pattern)
       @insns = []
-      Prism.parse("nil in #{pattern}").value.statements.body.first.pattern.accept(Compiler.new(self))
+      Prism.parse("nil in #{pattern}").value.statements.body.first.accept(Compiler.new(self))
+    end
+
+    def disasm
+      output = +""
+      pc = 0
+
+      while pc < insns.length
+        case (insn = insns[pc])
+        when :checklength
+          output << "%04d %-12s %d, %04d\n" % [pc, insn, insns[pc + 1], insns[pc + 2]]
+          pc += 3
+        when :checktype
+          output << "%04d %-12s %s, %04d\n" % [pc, insn, insns[pc + 1], insns[pc + 2]]
+          pc += 3
+        when :fail
+          output << "%04d %-12s\n" % [pc, insn]
+          pc += 1
+        when :jump
+          output << "%04d %-12s %04d\n" % [pc, insn, insns[pc + 1]]
+          pc += 2
+        when :pushfield
+          output << "%04d %-12s %s\n" % [pc, insn, insns[pc + 1]]
+          pc += 2
+        when :pushindex
+          output << "%04d %-12s %d\n" % [pc, insn, insns[pc + 1]]
+          pc += 2
+        when :pop
+          output << "%04d %-12s\n" % [pc, insn]
+          pc += 1
+        else
+          binding.irb
+        end
+      end
+
+      output
     end
 
     def run(node)
       stack = [node]
-      pc = 0
 
-      while (insn = insns[pc])
-        case insn
+      pc = 0
+      max_pc = insns.length
+
+      while pc < max_pc
+        case insns[pc]
         when :checklength
-          break unless stack[-1].length == insns[pc + 1]
-          pc += 2
+          if stack[-1].length == insns[pc + 1]
+            pc += 3
+          else
+            pc = insns[pc + 2]
+          end
         when :checktype
-          break unless stack[-1].is_a?(insns[pc + 1])
-          pc += 2
+          if stack[-1].is_a?(insns[pc + 1])
+            pc += 3
+          else
+            pc = insns[pc + 2]
+          end
+        when :fail
+          return false
+        when :jump
+          pc = insns[pc + 1]
         when :pushfield
           stack.push(stack[-1].public_send(insns[pc + 1]))
           pc += 2
@@ -126,24 +202,29 @@ module Prism
         when :pop
           stack.pop
           pc += 1
-        when :match
-          return true
         end
       end
 
-      false
+      true
     end
 
-    def checklength(length)
-      insns.push(:checklength, length)
+    def checklength(length, label)
+      insns.push(:checklength, length, -1)
+      label << insns.length - 1
     end
 
-    def checktype(type)
-      insns.push(:checktype, type)
+    def checktype(type, label)
+      insns.push(:checktype, type, -1)
+      label << insns.length - 1
     end
 
-    def match
-      insns.push(:match)
+    def fail
+      insns.push(:fail)
+    end
+
+    def jump(label)
+      insns.push(:jump, -1)
+      label << insns.length - 1
     end
 
     def pop
@@ -156,6 +237,12 @@ module Prism
 
     def pushindex(index)
       insns.push(:pushindex, index)
+    end
+
+    def pushlabel(label)
+      label.pcs.each do |pc|
+        insns[pc] = insns.length
+      end
     end
   end
 end
