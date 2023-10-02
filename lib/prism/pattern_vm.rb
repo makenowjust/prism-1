@@ -536,6 +536,32 @@ module Prism
     # These methods are used to optimize/finalize bytecode.                    #
     ############################################################################
 
+    # Iterate over each instruction in the bytecode.
+    def each_insn
+      pc = 0
+      max_pc = insns.length
+
+      while pc < max_pc
+        insn = insns[pc]
+        yield pc, insn
+
+        case insn
+        when :fail, :pop
+          pc += 1
+        when :jump, :pushfield, :pushindex
+          pc += 2
+        when :checklength, :checknil, :checkobject, :checktype, :splittype
+          pc += 3
+        else
+          if insn.is_a?(Label)
+            pc += 1
+          else
+            raise "Unknown instruction: #{insn.inspect}"
+          end
+        end
+      end
+    end
+
     # Accept a label and find the label that it should actually be jumping to
     # in case of a jump->jump sequence.
     def follow_jump(label)
@@ -581,27 +607,15 @@ module Prism
 
     # Make a pass over the instructions to eliminate jump->jump sequences.
     def optimize_jumps
-      pc = 0
-      max_pc = insns.length
-
-      while pc < max_pc
-        case insns[pc]
-        when :fail, :pop
-          pc += 1
+      each_insn do |pc, insn|
+        case insn
         when :jump
           optimize_jump(pc + 1)
-          pc += 2
-        when :pushfield, :pushindex
-          pc += 2
         when :checklength, :checknil, :checkobject, :checktype
           optimize_jump(pc + 1)
-          pc += 3
         when :splittype
           optimize_split(pc + 1)
           optimize_jump(pc + 2)
-          pc += 3
-        else
-          pc += 1
         end
       end
     end
@@ -610,50 +624,32 @@ module Prism
     def link_labels
       # First, we need to find all of the PCs in the list of instructions and
       # track where they are to find their current PCs.
-      pc = 0
-      max_pc = insns.length
-
-      pcs = {}
-      while pc < max_pc
-        case (insn = insns[pc])
-        when :fail, :pop
-          pc += 1
-        when :jump, :pushfield, :pushindex
-          pc += 2
-        when :checklength, :checknil, :checkobject, :checktype, :splittype
-          pc += 3
-        else
-          if insn.is_a?(Label)
-            (pcs[pc] ||= []) << insn
-            pc += 1
-          else
-            raise "Unknown instruction: #{insn.inspect}"
-          end
+      old_pcs = {}
+      each_insn do |pc, insn|
+        if insn.is_a?(Label)
+          (old_pcs[pc] ||= []) << insn
         end
       end
 
       # Next, we need to find their new PCs by accounting for them being
       # removed from the list of instructions.
-      pcs.transform_keys!.with_index do |key, index|
-        key - index
-      end
+      old_pcs.transform_keys!.with_index { |key, index| key - index }
 
       # Next, set up the new list of labels to point to the correct PCs.
-      pcs = pcs.each_with_object({}) do |(pc, labels), result|
-        labels.each do |label|
-          result[label] = pc
-        end
+      new_pcs = {}
+      old_pcs.each do |pc, labels|
+        labels.each { |label| new_pcs[label] = pc }
       end
 
       # Next, we need to go back and patch the instructions where we should be
       # jumping to labels to point to the correct PC.
       labels.each do |label|
         label.jumps.each do |pc|
-          insns[pc] = pcs[label]
+          insns[pc] = new_pcs[label]
         end
 
         label.splits.each do |(pc, type)|
-          insns[pc][type] = pcs[label]
+          insns[pc][type] = new_pcs[label]
         end
       end
 
