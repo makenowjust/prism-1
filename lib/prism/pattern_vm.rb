@@ -117,47 +117,30 @@ module Prism
     # human-readable format.
     def disasm
       output = +""
-      pc = 0
-
-      while pc < insns.length
-        case (insn = insns[pc])
+      each_insn do |pc, insn|
+        case insn
         when :checklength
           output << "%04d %-16s %d, %s\n" % [pc, insn, insns[pc + 1], disasm_label(insns[pc + 2])]
-          pc += 3
         when :checknil
           output << "%04d %-16s %s\n" % [pc, insn, disasm_label(insns[pc + 1])]
-          pc += 2
         when :checkobject
           output << "%04d %-16s %s, %s\n" % [pc, insn, insns[pc + 1].inspect, disasm_label(insns[pc + 2])]
-          pc += 3
         when :checktype
           output << "%04d %-16s %s, %s\n" % [pc, insn, insns[pc + 1], disasm_label(insns[pc + 2])]
-          pc += 3
         when :fail
           output << "%04d %-16s\n" % [pc, insn]
-          pc += 1
         when :jump
           output << "%04d %-16s %s\n" % [pc, insn, disasm_label(insns[pc + 1])]
-          pc += 2
         when :opt_splittype
           output << "%04d %-16s %s, %s\n" % [pc, insn, disasm_split(insns[pc + 1]), disasm_label(insns[pc + 2])]
-          pc += 3
         when :pushfield
           output << "%04d %-16s %s\n" % [pc, insn, insns[pc + 1]]
-          pc += 2
         when :pushindex
           output << "%04d %-16s %d\n" % [pc, insn, insns[pc + 1]]
-          pc += 2
         when :pop
           output << "%04d %-16s\n" % [pc, insn]
-          pc += 1
         else
-          if insn.is_a?(Label)
-            output << "%04d:\n" % pc
-            pc += 1
-          else
-            raise "Unknown instruction: #{insn.inspect}"
-          end
+          output << "%04d:\n" % pc
         end
       end
 
@@ -591,6 +574,27 @@ module Prism
     # These methods are used to optimize/finalize bytecode.                    #
     ############################################################################
 
+    # Iterate over each instruction in the bytecode.
+    def each_insn(pc = 0)
+      max_pc = insns.length
+
+      while pc < max_pc
+        insn = insns[pc]
+        yield pc, insn
+
+        case insn
+        when :fail, :pop
+          pc += 1
+        when :checknil, :jump, :pushfield, :pushindex
+          pc += 2
+        when :checklength, :checkobject, :checktype, :opt_splittype
+          pc += 3
+        else
+          pc += 1
+        end
+      end
+    end
+
     # Make a pass over the labels to eliminate jump->jump sequences.
     def optimize_jumps
       labels.each do |label|
@@ -626,14 +630,12 @@ module Prism
       while (pc = queue.shift)
         blocks[pc] = []
 
-        while pc < max_pc
-          case (insn = insns[pc])
+        each_insn(pc) do |pc, insn|
+          case insn
           when :checknil
             queue << insns[pc + 1].pc
-            pc += 2
           when :checklength, :checkobject, :checktype
             queue << insns[pc + 2].pc
-            pc += 3
           when :fail
             break
           when :jump
@@ -643,16 +645,6 @@ module Prism
             queue.concat(insns[pc + 1].values.map(&:pc))
             queue << insns[pc + 2].pc
             break
-          when :pop
-            pc += 1
-          when :pushfield, :pushindex
-            pc += 2
-          else
-            if insn.is_a?(Label)
-              pc += 1
-            else
-              raise "Unknown instruction: #{insn.inspect}"
-            end
           end
         end
       end
@@ -661,35 +653,25 @@ module Prism
       # lists.
       blocks.each do |pc, block|
         start_pc = pc
+        end_pc = pc
 
-        while pc < max_pc
-          case (insn = insns[pc])
-          when :fail, :pop
-            pc += 1
-          when :checknil
-            pc += 2
-          when :pushfield, :pushindex
-            pc += 2
-          when :checklength, :checkobject, :checktype
-            pc += 3
-          when :jump
-            pc += 2
+        each_insn(start_pc) do |pc, insn|
+          if pc != start_pc && blocks.key?(pc)
+            end_pc = pc
             break
-          when :opt_splittype
-            pc += 3
-            break
-          else
-            if insn.is_a?(Label)
-              pc += 1
-            else
-              raise "Unknown instruction: #{insn.inspect}"
-            end
           end
 
-          break if blocks.key?(pc)
+          case insn
+          when :jump
+            end_pc = pc + 2
+            break
+          when :opt_splittype
+            end_pc = pc + 3
+            break
+          end
         end
 
-        block.concat(insns[start_pc...pc])
+        block.concat(insns[start_pc...end_pc])
       end
 
       # Next, schedule the blocks and determine the mapping of old PCs to new
@@ -708,23 +690,14 @@ module Prism
       # Now, we can update the labels to point to the correct PCs.
       labels.concat(new_labels.values)
 
-      pc = 0
-      max_pc = insns.length
-
-      while pc < max_pc
-        case (insn = insns[pc])
-        when :fail, :pop
-          pc += 1
-        when :pushfield, :pushindex
-          pc += 2
+      each_insn do |pc, insn|
+        case insn
         when :checknil, :jump
           new_labels.fetch(insns[pc + 1].pc).push_jump(pc + 1)
           insns[pc + 1] = new_labels.fetch(insns[pc + 1].pc)
-          pc += 2
         when :checklength, :checkobject, :checktype
           new_labels.fetch(insns[pc + 2].pc).push_jump(pc + 2)
           insns[pc + 2] = new_labels.fetch(insns[pc + 2].pc)
-          pc += 3
         when :opt_splittype
           split = insns[pc + 1]
           split.each do |type, old_label|
@@ -734,9 +707,6 @@ module Prism
 
           new_labels.fetch(insns[pc + 2].pc).push_jump(pc + 2)
           insns[pc + 2] = new_labels.fetch(insns[pc + 2].pc)
-          pc += 3
-        else
-          pc += 1
         end
       end
     end
