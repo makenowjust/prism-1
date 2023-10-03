@@ -205,7 +205,7 @@ module Prism
 
     # Run the instructions that this VM has compiled against a node. This will
     # return true if the node matches the pattern and false if it does not.
-    def run(node)
+    def call(node)
       stack = [node]
 
       pc = 0
