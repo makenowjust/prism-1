@@ -616,15 +616,6 @@ module Prism
       end
     end
 
-    class BasicBlock
-      attr_reader :insns, :exits
-
-      def initialize
-        @insns = []
-        @exits = []
-      end
-    end
-
     # Eliminate all of the instructions that are unreachable.
     def eliminate_unreachable
       blocks = {}
@@ -633,7 +624,7 @@ module Prism
 
       # First, find the start of every basic block.
       while (pc = queue.shift)
-        blocks[pc] = BasicBlock.new
+        blocks[pc] = []
 
         while pc < max_pc
           case (insn = insns[pc])
@@ -698,7 +689,7 @@ module Prism
           break if blocks.key?(pc)
         end
 
-        block.insns.concat(insns[start_pc...pc])
+        block.concat(insns[start_pc...pc])
       end
 
       # Next, schedule the blocks and determine the mapping of old PCs to new
@@ -711,7 +702,7 @@ module Prism
 
       blocks.each do |(old_pc, block)|
         new_labels[old_pc] = Label.new(insns.length) if old_pc != 0
-        insns.concat(block.insns)
+        insns.concat(block)
       end
 
       # Now, we can update the labels to point to the correct PCs.
