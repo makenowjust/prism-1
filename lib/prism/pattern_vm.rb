@@ -56,8 +56,8 @@ module Prism
       attr_accessor :pc
       attr_reader :jumps, :splits
 
-      def initialize
-        @pc = -1
+      def initialize(pc = -1)
+        @pc = pc
         @jumps = []
         @splits = []
       end
@@ -122,22 +122,22 @@ module Prism
       while pc < insns.length
         case (insn = insns[pc])
         when :checklength
-          output << "%04d %-12s %d, %04d\n" % [pc, insn, insns[pc + 1], insns[pc + 2]]
+          output << "%04d %-12s %d, %s\n" % [pc, insn, insns[pc + 1], disasm_label(insns[pc + 2])]
           pc += 3
         when :checknil
-          output << "%04d %-12s %04d\n" % [pc, insn, insns[pc + 1]]
+          output << "%04d %-12s %s\n" % [pc, insn, disasm_label(insns[pc + 1])]
           pc += 2
         when :checkobject
-          output << "%04d %-12s %s, %04d\n" % [pc, insn, insns[pc + 1].inspect, insns[pc + 2]]
+          output << "%04d %-12s %s, %s\n" % [pc, insn, insns[pc + 1].inspect, disasm_label(insns[pc + 2])]
           pc += 3
         when :checktype
-          output << "%04d %-12s %s, %04d\n" % [pc, insn, insns[pc + 1], insns[pc + 2]]
+          output << "%04d %-12s %s, %s\n" % [pc, insn, insns[pc + 1], disasm_label(insns[pc + 2])]
           pc += 3
         when :fail
           output << "%04d %-12s\n" % [pc, insn]
           pc += 1
         when :jump
-          output << "%04d %-12s %04d\n" % [pc, insn, insns[pc + 1]]
+          output << "%04d %-12s %s\n" % [pc, insn, disasm_label(insns[pc + 1])]
           pc += 2
         when :pushfield
           output << "%04d %-12s %s\n" % [pc, insn, insns[pc + 1]]
@@ -149,10 +149,15 @@ module Prism
           output << "%04d %-12s\n" % [pc, insn]
           pc += 1
         when :splittype
-          output << "%04d %-12s %s, %04d\n" % [pc, insn, insns[pc + 1].inspect, insns[pc + 2]]
+          output << "%04d %-12s %s, %s\n" % [pc, insn, disasm_split(insns[pc + 1]), disasm_label(insns[pc + 2])]
           pc += 3
         else
-          raise "Unknown instruction: #{insn.inspect}"
+          if insn.is_a?(Label)
+            output << "%04d:\n" % pc
+            pc += 1
+          else
+            raise "Unknown instruction: #{insn.inspect}"
+          end
         end
       end
 
@@ -421,6 +426,7 @@ module Prism
       @failing = nil
 
       optimize_jumps
+      eliminate_unreachable
       link_labels
     end
 
@@ -497,6 +503,21 @@ module Prism
 
       # Finally, return the constant that we found.
       current
+    end
+
+    # Disasm an object that could be a label or an offset.
+    def disasm_label(insn)
+      if insn.is_a?(Label)
+        "%04d" % insn.pc
+      else
+        "%04d" % insn
+      end
+    end
+
+    # Disasm a split hash.
+    def disasm_split(split)
+      pairs = split.map { |type, insn| "%s: %04d" % [type, insn.is_a?(Label) ? insn.pc : insn] }
+      "{ #{pairs.join(", ")} }"
     end
 
     # Generic visit method for any kind of node.
@@ -581,10 +602,150 @@ module Prism
 
         if current != label
           current.jumps.concat(label.jumps)
+          label.jumps.each do |pc|
+            insns[pc] = current
+          end
           label.jumps.clear
 
           current.splits.concat(label.splits)
+          label.splits.each do |(pc, type)|
+            insns[pc][type] = current
+          end
           label.splits.clear
+        end
+      end
+    end
+
+    class BasicBlock
+      attr_reader :insns, :exits
+
+      def initialize
+        @insns = []
+        @exits = []
+      end
+    end
+
+    # Eliminate all of the instructions that are unreachable.
+    def eliminate_unreachable
+      blocks = {}
+      queue = [0]
+      max_pc = insns.length
+
+      # First, find the start of every basic block.
+      while (pc = queue.shift)
+        blocks[pc] = BasicBlock.new
+
+        while pc < max_pc
+          case (insn = insns[pc])
+          when :checknil
+            queue << insns[pc + 1].pc
+            pc += 2
+          when :checklength, :checkobject, :checktype
+            queue << insns[pc + 2].pc
+            pc += 3
+          when :fail
+            break
+          when :jump
+            queue << insns[pc + 1].pc
+            break
+          when :pop
+            pc += 1
+          when :pushfield, :pushindex
+            pc += 2
+          when :splittype
+            queue.concat(insns[pc + 1].values.map(&:pc))
+            queue << insns[pc + 2].pc
+            break
+          else
+            if insn.is_a?(Label)
+              pc += 1
+            else
+              raise "Unknown instruction: #{insn.inspect}"
+            end
+          end
+        end
+      end
+
+      # Next, find the end of every basic block, and set their instruction
+      # lists.
+      blocks.each do |pc, block|
+        start_pc = pc
+
+        while pc < max_pc
+          case (insn = insns[pc])
+          when :fail, :pop
+            pc += 1
+          when :checknil
+            pc += 2
+          when :pushfield, :pushindex
+            pc += 2
+          when :checklength, :checkobject, :checktype
+            pc += 3
+          when :jump
+            pc += 2
+            break
+          when :splittype
+            pc += 3
+            break
+          else
+            if insn.is_a?(Label)
+              pc += 1
+            else
+              raise "Unknown instruction: #{insn.inspect}"
+            end
+          end
+
+          break if blocks.key?(pc)
+        end
+
+        block.insns.concat(insns[start_pc...pc])
+      end
+
+      # Next, schedule the blocks and determine the mapping of old PCs to new
+      # PCs so that we can properly update labels.
+      insns.clear
+      blocks = blocks.to_a.sort!
+
+      labels.clear
+      new_labels = {}
+
+      blocks.each do |(old_pc, block)|
+        new_labels[old_pc] = Label.new(insns.length) if old_pc != 0
+        insns.concat(block.insns)
+      end
+
+      # Now, we can update the labels to point to the correct PCs.
+      labels.concat(new_labels.values)
+
+      pc = 0
+      max_pc = insns.length
+
+      while pc < max_pc
+        case (insn = insns[pc])
+        when :fail, :pop
+          pc += 1
+        when :pushfield, :pushindex
+          pc += 2
+        when :checknil, :jump
+          new_labels.fetch(insns[pc + 1].pc).push_jump(pc + 1)
+          insns[pc + 1] = new_labels.fetch(insns[pc + 1].pc)
+          pc += 2
+        when :checklength, :checkobject, :checktype
+          new_labels.fetch(insns[pc + 2].pc).push_jump(pc + 2)
+          insns[pc + 2] = new_labels.fetch(insns[pc + 2].pc)
+          pc += 3
+        when :splittype
+          split = insns[pc + 1]
+          split.each do |type, old_label|
+            new_labels.fetch(old_label.pc).push_split(pc + 1, type)
+            split[type] = new_labels.fetch(old_label.pc)
+          end
+
+          new_labels.fetch(insns[pc + 2].pc).push_jump(pc + 2)
+          insns[pc + 2] = new_labels.fetch(insns[pc + 2].pc)
+          pc += 3
+        else
+          pc += 1
         end
       end
     end
@@ -593,21 +754,21 @@ module Prism
     def link_labels
       # First, we'll group the labels by PC, then transform the PCs into their
       # new PCs.
-      new_pcs = {}
+      new_labels = {}
       labels.group_by(&:pc).to_a.sort!.each_with_index do |(old_pc, labels), index|
         new_pc = old_pc - index
-        labels.each { |label| new_pcs[label] = new_pc }
+        labels.each { |label| new_labels[label] = new_pc }
       end
 
       # Next, we need to go back and patch the instructions where we should be
       # jumping to labels to point to the correct PC.
       labels.each do |label|
         label.jumps.each do |pc|
-          insns[pc] = new_pcs[label]
+          insns[pc] = new_labels[label]
         end
 
         label.splits.each do |(pc, type)|
-          insns[pc][type] = new_pcs[label]
+          insns[pc][type] = new_labels[label]
         end
       end
 
