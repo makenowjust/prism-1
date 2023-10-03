@@ -122,35 +122,35 @@ module Prism
       while pc < insns.length
         case (insn = insns[pc])
         when :checklength
-          output << "%04d %-12s %d, %s\n" % [pc, insn, insns[pc + 1], disasm_label(insns[pc + 2])]
+          output << "%04d %-16s %d, %s\n" % [pc, insn, insns[pc + 1], disasm_label(insns[pc + 2])]
           pc += 3
         when :checknil
-          output << "%04d %-12s %s\n" % [pc, insn, disasm_label(insns[pc + 1])]
+          output << "%04d %-16s %s\n" % [pc, insn, disasm_label(insns[pc + 1])]
           pc += 2
         when :checkobject
-          output << "%04d %-12s %s, %s\n" % [pc, insn, insns[pc + 1].inspect, disasm_label(insns[pc + 2])]
+          output << "%04d %-16s %s, %s\n" % [pc, insn, insns[pc + 1].inspect, disasm_label(insns[pc + 2])]
           pc += 3
         when :checktype
-          output << "%04d %-12s %s, %s\n" % [pc, insn, insns[pc + 1], disasm_label(insns[pc + 2])]
+          output << "%04d %-16s %s, %s\n" % [pc, insn, insns[pc + 1], disasm_label(insns[pc + 2])]
           pc += 3
         when :fail
-          output << "%04d %-12s\n" % [pc, insn]
+          output << "%04d %-16s\n" % [pc, insn]
           pc += 1
         when :jump
-          output << "%04d %-12s %s\n" % [pc, insn, disasm_label(insns[pc + 1])]
+          output << "%04d %-16s %s\n" % [pc, insn, disasm_label(insns[pc + 1])]
           pc += 2
+        when :opt_splittype
+          output << "%04d %-16s %s, %s\n" % [pc, insn, disasm_split(insns[pc + 1]), disasm_label(insns[pc + 2])]
+          pc += 3
         when :pushfield
-          output << "%04d %-12s %s\n" % [pc, insn, insns[pc + 1]]
+          output << "%04d %-16s %s\n" % [pc, insn, insns[pc + 1]]
           pc += 2
         when :pushindex
-          output << "%04d %-12s %d\n" % [pc, insn, insns[pc + 1]]
+          output << "%04d %-16s %d\n" % [pc, insn, insns[pc + 1]]
           pc += 2
         when :pop
-          output << "%04d %-12s\n" % [pc, insn]
+          output << "%04d %-16s\n" % [pc, insn]
           pc += 1
-        when :splittype
-          output << "%04d %-12s %s, %s\n" % [pc, insn, disasm_split(insns[pc + 1]), disasm_label(insns[pc + 2])]
-          pc += 3
         else
           if insn.is_a?(Label)
             output << "%04d:\n" % pc
@@ -202,6 +202,8 @@ module Prism
           return false
         when :jump
           pc = insns[pc + 1]
+        when :opt_splittype
+          pc = insns[pc + 1].fetch(stack[-1].type, insns[pc + 2])
         when :pushfield
           stack.push(stack[-1].public_send(insns[pc + 1]))
           pc += 2
@@ -211,8 +213,6 @@ module Prism
         when :pop
           stack.pop
           pc += 1
-        when :splittype
-          pc = insns[pc + 1].fetch(stack[-1].type, insns[pc + 2])
         else
           raise "Unknown instruction: #{insns[pc].inspect}"
         end
@@ -261,7 +261,7 @@ module Prism
       # we check the type once and then jump to the correct clause.
       if !types.key?(:ungrouped) && types.length > 1
         labels = types.transform_values { label }
-        splittype(labels, failing)
+        opt_splittype(labels, failing)
 
         types.each do |type, clauses|
           pushlabel(labels[type])
@@ -564,6 +564,12 @@ module Prism
       new_label
     end
 
+    def opt_splittype(labels, label)
+      insns.push(:opt_splittype, labels, label)
+      labels.each { |type, type_label| type_label.push_split(insns.length - 2, type) }
+      label.push_jump(insns.length - 1)
+    end
+
     def pop
       insns.push(:pop)
     end
@@ -579,12 +585,6 @@ module Prism
     def pushlabel(label)
       label.pc = insns.length
       insns.push(label)
-    end
-
-    def splittype(labels, label)
-      insns.push(:splittype, labels, label)
-      labels.each { |type, type_label| type_label.push_split(insns.length - 2, type) }
-      label.push_jump(insns.length - 1)
     end
 
     ############################################################################
@@ -648,14 +648,14 @@ module Prism
           when :jump
             queue << insns[pc + 1].pc
             break
+          when :opt_splittype
+            queue.concat(insns[pc + 1].values.map(&:pc))
+            queue << insns[pc + 2].pc
+            break
           when :pop
             pc += 1
           when :pushfield, :pushindex
             pc += 2
-          when :splittype
-            queue.concat(insns[pc + 1].values.map(&:pc))
-            queue << insns[pc + 2].pc
-            break
           else
             if insn.is_a?(Label)
               pc += 1
@@ -684,7 +684,7 @@ module Prism
           when :jump
             pc += 2
             break
-          when :splittype
+          when :opt_splittype
             pc += 3
             break
           else
@@ -734,7 +734,7 @@ module Prism
           new_labels.fetch(insns[pc + 2].pc).push_jump(pc + 2)
           insns[pc + 2] = new_labels.fetch(insns[pc + 2].pc)
           pc += 3
-        when :splittype
+        when :opt_splittype
           split = insns[pc + 1]
           split.each do |type, old_label|
             new_labels.fetch(old_label.pc).push_split(pc + 1, type)
