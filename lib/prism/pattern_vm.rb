@@ -1,6 +1,62 @@
 # frozen_string_literal: true
 
 module Prism
+  # The pattern virtual machine is responsible for compiling a pattern into a
+  # set of instructions that can be used to match against nodes. The virtual
+  # machine instructions are:
+  #
+  # checklength <length>, <label>
+  #
+  # - Check that the length of the value on the top of the stack is equal to the
+  #   given length. If it is not, then jump to the given label. Otherwise fall
+  #   through to the next instruction.
+  #
+  # checknil <label>
+  #
+  # - Check that the value on the top of the stack is nil. If it is not, then
+  #   jump to the given label. Otherwise fall through to the next instruction.
+  #
+  # checkobject <object>, <label>
+  #
+  # - Check that the value on the top of the stack is equal to the given object
+  #   using the === method. If it is not, then jump to the given label.
+  #   Otherwise fall through to the next instruction.
+  #
+  # checktype <type>, <label>
+  #
+  # - Check that the value on the top of the stack is an instance of the given
+  #   type. If it is not, then jump to the given label. Otherwise fall through
+  #   to the next instruction.
+  #
+  # fail
+  #
+  # - Immediately fail the pattern matching.
+  #
+  # jump <label>
+  #
+  # - Jump directly to the given label.
+  #
+  # opt_splittype <split>, <label>
+  #
+  # - Check the type of the value on the top of the stack using the #type
+  #   method. The split object is a hash that maps types to labels. If the type
+  #   is in the split object, then jump to the label. Otherwise jump directly to
+  #   the given label.
+  #
+  # pushfield <name>
+  #
+  # - Fetch the field from the object on the top of the stack using the named
+  #   method. Push the value onto the stack.
+  #
+  # pushindex <index>
+  #
+  # - Fetch the index from the object on the top of the stack using the given
+  #   index and the [] method. Push the value onto the stack.
+  #
+  # pop
+  #
+  # - Pop the top value off of the stack.
+  #
   class PatternVM
     # Raised when the query given to a pattern is either invalid Ruby syntax or
     # is using syntax that we don't yet support.
